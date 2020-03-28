@@ -1,10 +1,9 @@
 use serde::Deserialize;
 #[allow(unused_imports)]
-use std::io::{Cursor, Read, Write};
+use std::io::{sink, Cursor, Read, Write};
 
-use bus::Bus;
+use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
-use std::ptr;
 use threadpool::ThreadPool;
 
 #[derive(Debug, Deserialize)]
@@ -31,36 +30,40 @@ pub fn start(config: Config) {
     loop {
         let (mut client, client_addr) = listener.accept().unwrap();
         println!("incoming connection from: {}", client_addr);
-        let mut bus = Bus::new(255);
-        let primary = &config.upstreams[0];
-        for upstream in config.upstreams.iter() {
-            let mut rx = bus.add_rx();
-            let to_arc = match TcpStream::connect(upstream) {
-                Ok(stream) => stream,
-                Err(err) => {
-                    println!("Failed to connect to {}: {}", upstream, err.to_string());
-                    continue;
-                }
-            };
-            println!("connected to {}", upstream);
+        let upstreams: Vec<TcpStream> = config
+            .upstreams
+            .iter()
+            .map(|upstream| {
+                let target = TcpStream::connect(upstream).expect("Error connecting to target!");
+                println!("connected to {}", upstream);
+                target
+            })
+            .collect();
 
-            let (mut rhs_tx, mut rhs_rx) =
-                (to_arc.try_clone().unwrap(), to_arc.try_clone().unwrap());
+        let mut ori_rx = client.try_clone().unwrap();
+        let mut target_rx = (&upstreams[0]).try_clone().unwrap();
+        pool.execute(move || {
+            std::io::copy(&mut target_rx, &mut ori_rx).unwrap();
+        });
 
-            pool.execute(move || loop {
-                match rx.recv() {
-                    Ok(payload) => rhs_rx.write(buf),
-                    _ => break,
-                }
+        for upstream in &upstreams[1..] {
+            let mut clone_tx = upstream.try_clone().unwrap();
+            pool.execute(move || {
+                std::io::copy(&mut clone_tx, &mut sink()).unwrap();
             });
-
-            if ptr::eq(primary, upstream) {
-                let mut lhs_rx = client.try_clone().unwrap();
-                pool.execute(move || {
-                    std::io::copy(&mut rhs_tx, &mut lhs_rx).unwrap();
-                });
-            }
         }
+        pool.execute(move || loop {
+            let mut buf = [0 as u8; 255];
+            let len = match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(len) => len,
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            for mut upstream in upstreams.iter() {
+                upstream.write_all(&buf[..len]).unwrap();
+            }
+        });
         if config.run_once == Some(true) {
             break;
         }
