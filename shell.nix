@@ -1,27 +1,21 @@
 { sources ? import ./nix/sources.nix }:
 let
-moz_overlay = import sources.nixpkgs-mozilla;
-nixpkgs = import sources.nixpkgs { overlays = [moz_overlay]; };
-rustChannel = nixpkgs.latest.rustChannels.stable.rust.override {
+nixpkgs = import sources.nixpkgs {};
+rustChannel = (import ./nix/rust.nix { inherit sources; }).override {
   extensions = [
-    "rust-src"
-      "rls-preview"
-      "clippy-preview"
+    "clippy-preview"
       "rustfmt-preview"
+      "rust-src"
+      "rust-analysis"
   ];
 };
 in
 with nixpkgs;
-stdenv.mkDerivation {
-  name = "rust-env";
+pkgs.mkShell {
   buildInputs = [
     rustChannel
-      rls
-      rustup
       cargo-watch
       kcov
-      ansible
-      sshpass
   ];
 
 # Set Environment Variables
