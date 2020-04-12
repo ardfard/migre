@@ -1,10 +1,12 @@
+use futures_util::future::join_all;
 use serde::Deserialize;
-#[allow(unused_imports)]
-use std::io::{sink, Cursor, Read, Write};
-
+use std::future::Future;
 use std::io::ErrorKind;
-use std::net::{TcpListener, TcpStream};
-use threadpool::ThreadPool;
+use std::sync::Arc;
+use tokio::net::tcp::{ReadHalf, WriteHalf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::prelude::*;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -20,55 +22,56 @@ impl Config {
     }
 }
 
-pub fn start(config: Config) {
-    let listener = TcpListener::bind(config.listen_addr).expect("unable to bind address");
-    println!("Start Listening on {}", listener.local_addr().unwrap());
-    let num_worker = config
-        .worker_pool_size
-        .unwrap_or_else(|| num_cpus::get() + 1);
-    let pool = ThreadPool::new(num_worker);
+async fn process_incoming(upstream_addrs: Arc<Vec<String>>, mut client_stream: TcpStream) {
+    let mut join_handles = Vec::new();
+    let (mut client_read, mut client_write) = client_stream.split();
+    for addr in upstream_addrs.iter() {
+        let upstream = String::from(addr);
+        join_handles.push(tokio::spawn(async {
+            let target = TcpStream::connect(upstream).await.unwrap();
+            target
+        }));
+    }
+
+    let mut write_halfes: Vec<TcpStream> = join_all(join_handles)
+        .await
+        .into_iter()
+        .map(|x| x.unwrap())
+        .collect();
+
     loop {
-        let (mut client, client_addr) = listener.accept().unwrap();
-        println!("incoming connection from: {}", client_addr);
-        let upstreams: Vec<TcpStream> = config
-            .upstreams
-            .iter()
-            .map(|upstream| {
-                let target = TcpStream::connect(upstream).expect("Error connecting to target!");
-                println!("connected to {}", upstream);
-                target
-            })
-            .collect();
-
-        let mut ori_rx = client.try_clone().unwrap();
-        let mut target_rx = (&upstreams[0]).try_clone().unwrap();
-        pool.execute(move || {
-            std::io::copy(&mut target_rx, &mut ori_rx).unwrap();
-        });
-
-        for upstream in &upstreams[1..] {
-            let mut clone_tx = upstream.try_clone().unwrap();
-            pool.execute(move || {
-                std::io::copy(&mut clone_tx, &mut sink()).unwrap();
-            });
+        let mut buf = [0 as u8; 255];
+        let len = match client_read.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(len) => len,
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let mut handles = Vec::with_capacity(write_halfes.len());
+        for upstream in write_halfes.iter_mut() {
+            handles.push(upstream.write_all(&buf[..len]));
         }
-        pool.execute(move || loop {
-            let mut buf = [0 as u8; 255];
-            let len = match client.read(&mut buf) {
-                Ok(0) => break,
-                Ok(len) => len,
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            for mut upstream in upstreams.iter() {
-                upstream.write_all(&buf[..len]).unwrap();
-            }
+        join_all(handles).await;
+    }
+}
+
+pub async fn start(config: Config) {
+    let mut listener = TcpListener::bind(config.listen_addr)
+        .await
+        .expect("unable to bind address");
+    println!("Start Listening on {}", listener.local_addr().unwrap());
+    let upstreams = Arc::new(config.upstreams);
+    loop {
+        let (client, client_addr) = listener.accept().await.unwrap();
+        println!("incoming connection from: {}", client_addr);
+        let cloned_upstreams = upstreams.clone();
+        tokio::spawn(async move {
+            process_incoming(cloned_upstreams, client).await;
         });
         if config.run_once == Some(true) {
             break;
         }
     }
-    pool.join();
 }
 
 #[cfg(test)]
@@ -94,7 +97,7 @@ mod tests {
     }
 
     fn dummy_tcp_service(listen_addr: &str) {
-        let listener = TcpListener::bind(listen_addr).unwrap();
+        let listener = TcpListener::bind(listen_addr);
         let (mut stream, _) = listener.accept().unwrap();
         let mut buffer = BufReader::new(&stream);
         let mut payload = String::new();
