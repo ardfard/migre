@@ -14,7 +14,6 @@ pub struct Config {
     upstreams: Vec<String>,
     listen_addr: String,
     run_once: Option<bool>,
-    worker_pool_size: Option<usize>,
 }
 
 impl Config {
@@ -24,17 +23,19 @@ impl Config {
 }
 
 async fn process_incoming(upstream_addrs: Arc<Vec<String>>, mut client_stream: TcpStream) {
-    let mut join_handles = Vec::new();
-    for addr in upstream_addrs.iter() {
-        let addr_str = String::from(addr);
-        join_handles.push(task::spawn(async move {
-            println!("connecting to {}", addr_str);
-            let target = TcpStream::connect(addr_str)
-                .await
-                .expect("Error connection to target!");
-            target
-        }));
-    }
+    let join_handles: Vec<_> = upstream_addrs
+        .iter()
+        .map(|addr| {
+            let addr_str = String::from(addr);
+            task::spawn(async move {
+                println!("connecting to {}", addr_str);
+                let target = TcpStream::connect(addr_str)
+                    .await
+                    .expect("Error connection to target!");
+                target
+            })
+        })
+        .collect();
 
     let mut upstreams: Vec<TcpStream> = join_all(join_handles).await.into_iter().collect();
 
@@ -56,10 +57,10 @@ async fn process_incoming(upstream_addrs: Arc<Vec<String>>, mut client_stream: T
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        let mut handles = Vec::with_capacity(upstreams.len());
-        for upstream in upstreams.iter_mut() {
-            handles.push(upstream.write_all(&buf[..len]));
-        }
+        let handles: Vec<_> = upstreams
+            .iter_mut()
+            .map(|upstream| upstream.write_all(&buf[..len]))
+            .collect();
         join_all(handles).await;
     }
 }
@@ -95,7 +96,6 @@ mod tests {
         listen_addr = "127.0.0.1:12345"
         upstreams = ["127.0.0.1:8000", "127.0.0.1:8001"]
         run_once = true
-        worker_pool_size = 8
     "#;
 
     #[test]
@@ -104,7 +104,6 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1:12345");
         assert_eq!(config.upstreams[0], "127.0.0.1:8000");
         assert_eq!(config.run_once, Some(true));
-        assert_eq!(config.worker_pool_size, Some(8));
     }
 
     async fn dummy_tcp_service(listen_addr: &str) {
