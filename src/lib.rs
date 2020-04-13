@@ -1,12 +1,12 @@
 use futures_util::future::join_all;
 use serde::Deserialize;
-use std::future::Future;
 use std::io::ErrorKind;
 use std::sync::Arc;
-use tokio::net::tcp::{ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::prelude::*;
-use tokio::task::JoinHandle;
+use tokio::{
+    io,
+    net::{TcpListener, TcpStream},
+    prelude::*,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -22,22 +22,35 @@ impl Config {
     }
 }
 
-async fn process_incoming(upstream_addrs: Arc<Vec<String>>, mut client_stream: TcpStream) {
-    let mut join_handles = Vec::new();
-    let (mut client_read, mut client_write) = client_stream.split();
-    for addr in upstream_addrs.iter() {
-        let upstream = String::from(addr);
-        join_handles.push(tokio::spawn(async {
-            let target = TcpStream::connect(upstream).await.unwrap();
-            target
-        }));
-    }
+async fn process_incoming(upstream_addrs: Arc<Vec<String>>, client_stream: TcpStream) {
+    let join_handles: Vec<_> = upstream_addrs
+        .iter()
+        .map(|addr| {
+            let addr_str = String::from(addr);
+            tokio::spawn(async move {
+                println!("connecting to {}", addr_str);
+                let target = TcpStream::connect(addr_str)
+                    .await
+                    .expect("Error connection to target!");
+                io::split(target)
+            })
+        })
+        .collect();
 
-    let mut write_halfes: Vec<TcpStream> = join_all(join_handles)
+    let (mut reads, mut writes): (Vec<_>, Vec<_>) = join_all(join_handles)
         .await
         .into_iter()
-        .map(|x| x.unwrap())
-        .collect();
+        .map(|u| u.unwrap())
+        .unzip();
+
+    let (mut client_read, mut client_write) = io::split(client_stream);
+    let mut head = reads.swap_remove(0);
+
+    tokio::spawn(async move { io::copy(&mut head, &mut client_write).await });
+
+    for mut upstream in reads {
+        tokio::spawn(async move { io::copy(&mut upstream, &mut io::sink()).await });
+    }
 
     loop {
         let mut buf = [0 as u8; 255];
@@ -47,10 +60,10 @@ async fn process_incoming(upstream_addrs: Arc<Vec<String>>, mut client_stream: T
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        let mut handles = Vec::with_capacity(write_halfes.len());
-        for upstream in write_halfes.iter_mut() {
-            handles.push(upstream.write_all(&buf[..len]));
-        }
+        let handles: Vec<_> = writes
+            .iter_mut()
+            .map(|upstream| upstream.write_all(&buf[..len]))
+            .collect();
         join_all(handles).await;
     }
 }
@@ -77,14 +90,14 @@ pub async fn start(config: Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
     use std::net::Shutdown;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     static CONF_STR: &str = r#"
         listen_addr = "127.0.0.1:12345"
         upstreams = ["127.0.0.1:8000", "127.0.0.1:8001"]
         run_once = true
-        worker_pool_size = 8
     "#;
 
     #[test]
@@ -93,43 +106,41 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1:12345");
         assert_eq!(config.upstreams[0], "127.0.0.1:8000");
         assert_eq!(config.run_once, Some(true));
-        assert_eq!(config.worker_pool_size, Some(8));
     }
 
-    fn dummy_tcp_service(listen_addr: &str) {
-        let listener = TcpListener::bind(listen_addr);
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut buffer = BufReader::new(&stream);
+    async fn dummy_tcp_service(listen_addr: &str) {
+        let mut listener = TcpListener::bind(listen_addr).await.unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.split();
+        let mut buffer = BufReader::new(read);
         let mut payload = String::new();
         println!("start listening dummy");
-        buffer.read_line(&mut payload).unwrap();
+        buffer.read_line(&mut payload).await.unwrap();
         println!("payload incoming: {}", payload);
-        stream.write_all(payload.as_bytes()).unwrap();
-        stream.flush().unwrap();
+        write.write_all(payload.as_bytes()).await.unwrap();
+        write.flush().await.unwrap();
     }
 
-    #[test]
-    fn proxy_tcp_request() {
+    #[tokio::test]
+    async fn proxy_tcp_request() {
         let config = Config::from_config_str(&CONF_STR);
-        let thr1 = std::thread::spawn(move || {
-            dummy_tcp_service("127.0.0.1:8000");
+        let thr1 = tokio::spawn(async {
+            dummy_tcp_service("127.0.0.1:8000").await;
         });
-        let thr2 = std::thread::spawn(move || {
-            dummy_tcp_service("127.0.0.1:8001");
+        let thr2 = tokio::spawn(async {
+            dummy_tcp_service("127.0.0.1:8001").await;
         });
-        let thr = std::thread::spawn(move || start(config));
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        let thr = tokio::spawn(async { start(config).await });
+        tokio::time::delay_for(Duration::from_millis(100)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:12345").unwrap();
-        stream.write_all("hello\n".as_bytes()).unwrap();
-        stream.flush().unwrap();
+        let mut stream = TcpStream::connect("127.0.0.1:12345").await.unwrap();
+        stream.write_all("hello\n".as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
         stream.shutdown(Shutdown::Write).unwrap();
         let mut result = String::new();
-        stream.read_to_string(&mut result).unwrap();
+        stream.read_to_string(&mut result).await.unwrap();
         assert_eq!(result, "hello\n");
-        thr.join().unwrap();
-        thr1.join().unwrap();
-        thr2.join().unwrap();
+        let _ = tokio::join!(thr, thr1, thr2);
     }
 
     #[test]
