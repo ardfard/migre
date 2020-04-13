@@ -23,19 +23,16 @@ impl Config {
 }
 
 async fn process_incoming(upstream_addrs: Arc<Vec<String>>, mut client_stream: TcpStream) {
-    let join_handles: Vec<_> = upstream_addrs
-        .iter()
-        .map(|addr| {
-            let addr_str = String::from(addr);
-            task::spawn(async move {
-                println!("connecting to {}", addr_str);
-                let target = TcpStream::connect(addr_str)
-                    .await
-                    .expect("Error connection to target!");
-                target
-            })
-        })
-        .collect();
+    let join_handles = upstream_addrs.iter().map(|addr| {
+        let addr_str = String::from(addr);
+        async move {
+            println!("connecting to {}", addr_str);
+            let target = TcpStream::connect(addr_str)
+                .await
+                .expect("Error connection to target!");
+            target
+        }
+    });
 
     let mut upstreams: Vec<TcpStream> = join_all(join_handles).await.into_iter().collect();
 
@@ -107,11 +104,11 @@ mod tests {
     }
 
     async fn dummy_tcp_service(listen_addr: &str) {
+        println!("start listening dummy: {}", listen_addr);
         let listener = TcpListener::bind(listen_addr).await.unwrap();
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut buffer = BufReader::new(&stream);
         let mut payload = String::new();
-        println!("start listening dummy");
         buffer.read_line(&mut payload).await.unwrap();
         println!("payload incoming: {}", payload);
         stream.write_all(payload.as_bytes()).await.unwrap();
@@ -139,15 +136,5 @@ mod tests {
             assert_eq!(result, "hello\n");
             future::join3(thr, thr1, thr2).await;
         });
-    }
-
-    #[test]
-    fn test_pointer() {
-        let v = vec![String::from("horeee")];
-        let p = &v[0];
-        for v1 in v.iter() {
-            println!("{:p}", p);
-            println!("{:p}", v1);
-        }
     }
 }
